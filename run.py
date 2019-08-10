@@ -238,6 +238,11 @@ class FSTInterface(object):
 			odata = {}
 			fulldir = os.path.join(self.output_path, candidates[0])
 			for fn in os.listdir(fulldir):
+				if fn == '_instrumentation.txt':  # Handle specially
+					with open(os.path.join(fulldir, fn)) as fo:
+						for row in csv.reader(fo):
+							odata[row[0]] = row[1:]
+					continue
 				orow = None
 				for row in csv.DictReader(open(os.path.join(fulldir, fn))):
 					if row['Locus'] == '_OVERALL_':
@@ -245,7 +250,11 @@ class FSTInterface(object):
 						break
 				else:
 					raise RuntimeError(f'Case {case.get_name()}: could not find _OVERALL_ data')
-				odata[os.path.splitext(fn)[0]] = float(orow['LRlog10'])
+				key = os.path.splitext(fn)[0]
+				try:
+					odata[key] = float(orow['LRlog10'])
+				except ValueError:  # XXX Encoding issues...
+					odata[key] = float('-inf')
 			if not self.no_unlink:
 				shutil.rmtree(fulldir)  # Avoid making listdir expensive, especially on Windows
 			if self.debug:
@@ -315,10 +324,11 @@ if __name__ == '__main__':
 			.set_theta(args.theta)\
 			.set_labkitid(args.labkitid)
 		)
-		if data is not None:
-			writer = csv.DictWriter(sys.stdout, sorted(data.keys()))
-			writer.writeheader()
-			writer.writerow(data)
+		#if data is not None:
+		#	writer = csv.DictWriter(sys.stdout, sorted(data.keys()))
+		#	writer.writeheader()
+		#	writer.writerow(data)
+		print(data)
 	finally:
 		#input('Pausing for a second for postmortem analysis... press enter when done.')
 		intf.close()

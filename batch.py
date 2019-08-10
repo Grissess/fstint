@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-import argparse, os, sqlite3, threading, json, time, csv, glob
+import argparse, os, sqlite3, threading, json, time, csv, glob, re
 
 import run
 
@@ -112,9 +112,10 @@ class Database(object):
 		return cur.rowcount
 		
 	def iter_results(self):
-		for row in self.con.execute(f'SELECT odata, {", ".join(self.CASE_KEY_SEQ)} FROM {self.TABLE} WHERE odata IS NOT NULL'):
+		for row in self.con.execute(f'SELECT odata, rowid, {", ".join(self.CASE_KEY_SEQ)} FROM {self.TABLE} WHERE odata IS NOT NULL'):
 			case = run.Case()
-			for k, v in zip(self.CASE_KEY_SEQ, row[1:]):
+			case.rowid = row[1]
+			for k, v in zip(self.CASE_KEY_SEQ, row[2:]):
 				setattr(case, k, v)
 			yield case, json.loads(row[0])
 		
@@ -222,6 +223,63 @@ if __name__ == '__main__':
 	parser_prepare.add_argument('--default-labkitid', help='Default labkitid where not specified in parameters')
 	parser_prepare.add_argument('--save-every-evidence', action='store_true', help='Commit the database after adding each evidence batch (per all profiles)')
 	
+	def cmd_prepare_related(args):
+		db = Database(args.dbfile, autosave=False)
+		
+		param_map = {}
+		for row in csv.DictReader(open(args.parameters)):
+			param_map[row['CaseNumber']] = row
+			
+		comp_re = re.compile(args.comparison_re)
+			
+		for casedir in os.listdir(args.case_base):
+			casepath = os.path.join(args.case_base, casedir)
+			if not os.path.isdir(casepath):
+				print(f'Skpping {casepath} (not a directory)')
+				continue
+			evpth = os.path.join(casepath, args.evidence_name)
+			if not os.path.exists(evpth):
+				print(f'Skipping {casepath} due to missing evidence at {evpth}')
+				continue
+			compth = os.path.join(casepath, args.comparison_re)
+			comps = []
+			for fn in os.listdir(casepath):
+				if comp_re.match(fn):
+					comps.append(os.path.join(casepath, fn))
+			if not comps:
+				print(f'Skipping {casepath} due to no matching contributors for {compth}')
+				continue
+				
+			params = param_map[casedir]
+			
+			if len(comps) != int(params['Contributors']):
+				print(f'WARN: case {casedir}: comparisons {len(comps)} not equal to supposed contributors {params["Contributors"]}')
+			
+			
+			case = run.Case()
+			case\
+				.set_evidence(os.path.abspath(evpth))\
+				.set_contributors(params['Contributors'])\
+				.set_deducible(params['Deducible'].lower() in ('yes', 'd'))\
+				.set_quantity(params['Quantity'])\
+				.set_theta(params.get('Theta', args.default_theta))\
+				.set_labkitid(params.get('LabKitId', args.default_labkitid))
+			for comp in comps:
+				case.set_profile(os.path.abspath(comp))
+				db.add_case(case)
+		
+		print('Done.')
+		db.save()
+		
+	parser_prepare_related = subparsers.add_parser('prepare_related')
+	parser_prepare_related.set_defaults(func=cmd_prepare_related)
+	parser_prepare_related.add_argument('-B', '--case-base', required=True, help='Load profiles under this directory')
+	parser_prepare_related.add_argument('-e', '--evidence-name', default='evidence.csv', help='Load evidence under this directory')
+	parser_prepare_related.add_argument('--comparison-re', default='\\d+.csv', help='Loaded evidence must match this glob pattern')
+	parser_prepare_related.add_argument('-P', '--parameters', required=True, help='Mapping file for evidence filenames to parameters (must have Evidence,Contributors,Deducible,Quantity, optionally Theta,LabKitId)')
+	parser_prepare_related.add_argument('--default-theta', type=float, default=0.01, help='Default theta where not specified in parameters')
+	parser_prepare_related.add_argument('--default-labkitid', help='Default labkitid where not specified in parameters')
+	
 	def cmd_status(args):
 		db = Database(args.dbfile, autosave=False)
 		
@@ -316,6 +374,52 @@ if __name__ == '__main__':
 	parser_run.add_argument('-v', '--verbose', action='store_true', help='Print messages from the workers')
 	parser_run.add_argument('--compare-tmout', type=int, default=30, help='How long to wait for comparison before crashing')
 	parser_run.add_argument('-i', '--progress-interval', type=int, default=10, help='Wait for this long between status messages')
+	
+	def cmd_export(args):
+		db = Database(args.dbfile, autosave=False)
+		
+		print('Aggregating output keys...')
+		
+		TYPE_TO_SQL = {
+			int: 'INTEGER',
+			float: 'REAL',
+			str: 'TEXT',
+			bytes: 'BLOB',
+		}
+		keytp = {}
+		fktables = set()
+		for case, odata in db.iter_results():
+			for k, v in odata.items():
+				if isinstance(v, (int, float, str, bytes)):
+					keytp[k] = TYPE_TO_SQL[type(v)]
+				elif isinstance(v, list):
+					fktables.add(k)
+				else:
+					raise ValueError(f'Unknown object type for export: {type(v)}')
+					
+		for k, cls in keycls.items():
+			print(f'{k}: {cls}')
+			
+		print('Creating database...')
+		
+		cols = Database.CASE_KEYS.copy()
+		cols.update(keytp)
+		edb = sqlite3.connect(args.exportfile)
+		edb.execute(f'CREATE TABLE IF NOT EXISTS {Database.TABLE_NAME} ({", ".join(k + " " + v for k, v in cols.items())})')
+		
+		print('Creating cross tables...')
+		
+		for k in fktables:
+			edb.execute(f'CREATE TABLE IF NOT EXISTS cross_{k} (rid, value)')
+			
+		print('Importing...')
+		
+		for case, odata in db.iter_results():
+			pass
+			
+	parser_export = subparsers.add_parser('export')
+	parser_export.set_defaults(func=cmd_export)
+	parser_export.add_argument('exportfile', help='Database file to create for export')
 	
 	gintf = parser_run.add_argument_group('Interface', 'Settings for the driver interface')
 	gintf.add_argument('-O', '--output-path', required=True, help='Path where FST is compiled to output data files (usually under repo root\\FST.Web\\Admin\\Upload). REQUIRED if you want this to output data.')
