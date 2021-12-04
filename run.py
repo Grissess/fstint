@@ -13,10 +13,20 @@ from selenium.webdriver.common.keys import Keys
 
 def name_of_path(pth):
 	return os.path.splitext(os.path.basename(pth))[0]
+	
+# Patch for expected_conditions.any_of
+def ec_any_of(*conditions):
+	def test(driver, conditions=conditions):
+		for cond in conditions:
+			ret = cond(driver)
+			if ret:
+				return ret
+		return False
+	return test
 
 class Case(object):
 	def __init__(self):
-		self.name = None  # Overrides automatic name
+		self._name = None  # Overrides automatic name
 		self.profile = None  # Path to TSV/CSV
 		self.evidence = None  # Path to TSV/CSV
 		self.contributors = None  # int
@@ -44,13 +54,15 @@ class Case(object):
 		return True
 		
 	def get_name(self):
-		if self.name is not None:
-			return self.name
+		if self._name is not None:
+			return self._name
 		return f'C_{name_of_path(self.profile)}.E_{name_of_path(self.evidence)}.Q_{self.quantity}.{"D" if self.deducible else "ND"}.N_{self.contributors}.T_{self.theta}'
 		
 	def set_name(self, name):
-		self.name = name
+		self._name = name
 		return self
+		
+	name = property(get_name, set_name)
 		
 	def set_profile(self, profile):
 		self.profile = profile
@@ -83,6 +95,9 @@ class Case(object):
 	COMPARISON_IDS = {2: '5', 3: '6'}
 	def get_comparison_id(self):
 		return self.COMPARISON_IDS.get(self.contributors, None)
+		
+	def __repr__(self):
+		return f'<Case: name={self.name} evidence={self.evidence} profile={self.profile} contributors={self.contributors} deducible={self.deducible} quantity={self.quantity} theta={self.theta} labkitid={self.labkitid}>'
 
 class FSTInterface(object):
 	def __init__(self, output_path=None, base_uri='http://localhost:2926', page_load_tmout=15, implicit_wait=None, wsize=(1024, 768), no_unlink=False, debug=False):
@@ -146,7 +161,7 @@ class FSTInterface(object):
 	FORMPFX = 'ctl00_MainContentHolder_'
 	def run(self, case, compare_tmout=30):
 		if self.debug:
-			print('Running case:', case.get_name(), file=sys.stderr)
+			print('Running case:', case, file=sys.stderr)
 			
 		if not case.is_valid():
 			raise ValueError(f'Case {case.get_name()} is not valid!')
@@ -198,11 +213,28 @@ class FSTInterface(object):
 		if self.debug:
 			print('Waiting for compare button...', file=sys.stderr)
 		
-		WebDriverWait(self.driver, compare_tmout).until(
-			expected_conditions.visibility_of_element_located((
-				By.ID, f"{self.FORMPFX}btnRead"
-			))
+		error_condition = expected_conditions.visibility_of_element_located(
+			(By.CSS_SELECTOR, 'div.bluetextBold'),
+			#'FST Has Encountered an Error',
 		)
+		
+		try:
+			WebDriverWait(self.driver, compare_tmout).until(
+				ec_any_of(
+					expected_conditions.visibility_of_element_located((
+						By.ID, f"{self.FORMPFX}btnRead"
+					)),
+					error_condition,
+				)
+			)
+		except TimeoutException:
+			raise RuntimeError(f'Case {case.get_name()}--consistency violated while transitioning from frmUpload')
+			
+		try:
+			if error_condition(self.driver):
+				raise RuntimeError(f'Case {case.get_name()}--FST encountered an error')
+		except NoSuchElementException:
+			pass  # this is a good thing
 		
 		if self.debug:
 			print('Done waiting for compare button', file=sys.stderr)

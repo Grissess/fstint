@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-import argparse, os, sqlite3, threading, json, time, csv, glob, re
+import argparse, os, sqlite3, threading, json, time, csv, glob, re, sys
 
 import run
 
@@ -111,6 +111,12 @@ class Database(object):
 			self.save()
 		return cur.rowcount
 		
+	def reset(self):
+		cur = self.con.execute(f'UPDATE {self.TABLE} SET claimant=NULL, odata=NULL')
+		if self.autosave:
+			self.save()
+		return cur.rowcount
+		
 	def iter_results(self):
 		for row in self.con.execute(f'SELECT odata, rowid, {", ".join(self.CASE_KEY_SEQ)} FROM {self.TABLE} WHERE odata IS NOT NULL'):
 			case = run.Case()
@@ -118,6 +124,15 @@ class Database(object):
 			for k, v in zip(self.CASE_KEY_SEQ, row[2:]):
 				setattr(case, k, v)
 			yield case, json.loads(row[0])
+			
+	def iter_cases(self):
+		for row in self.con.execute(f'SELECT rowid, {", ".join(self.CASE_KEY_SEQ)} FROM {self.TABLE}'):
+			case = run.Case()
+			for k, v in zip(self.CASE_KEY_SEQ, row[1:]):
+				setattr(case, k, v)
+			case.deducible = bool(case.deducible)
+			case.rowid = row[0]
+			yield case
 		
 class BatchExecutor(threading.Thread):
 	def __init__(self, db, intf, batch_size=64, compare_tmout=30, verbose=True):
@@ -146,7 +161,7 @@ class BatchExecutor(threading.Thread):
 					
 			self.print(f'Processing a batch of size {len(cases)}')
 			for case in cases:
-				odata = self.intf.run(case)
+				odata = self.intf.run(case, self.compare_tmout)
 				self.db.write_results(case, odata)
 			self.db.save()
 			self.print('Batch finished')
@@ -215,13 +230,42 @@ if __name__ == '__main__':
 	parser_prepare = subparsers.add_parser('prepare')
 	parser_prepare.set_defaults(func=cmd_prepare)
 	parser_prepare.add_argument('-p', '--profile-dir', required=True, help='Load profiles under this directory')
-	parser_prepare.add_argument('--profile-glob', default='*.csv', help='Loaded profiles must match this glob pattern')
+	parser_prepare.add_argument('--profile-glob', default='*.tsv', help='Loaded profiles must match this glob pattern')
 	parser_prepare.add_argument('-e', '--evidence-dir', required=True, help='Load evidence under this directory')
-	parser_prepare.add_argument('--evidence-glob', default='*.csv', help='Loaded evidence must match this glob pattern')
+	parser_prepare.add_argument('--evidence-glob', default='*.tsv', help='Loaded evidence must match this glob pattern')
 	parser_prepare.add_argument('-P', '--parameters', required=True, help='Mapping file for evidence filenames to parameters (must have Evidence,Contributors,Deducible,Quantity, optionally Theta,LabKitId)')
-	parser_prepare.add_argument('--default-theta', type=float, default=0.01, help='Default theta where not specified in parameters')
+	parser_prepare.add_argument('--default-theta', type=float, default=0.03, help='Default theta where not specified in parameters')
 	parser_prepare.add_argument('--default-labkitid', help='Default labkitid where not specified in parameters')
 	parser_prepare.add_argument('--save-every-evidence', action='store_true', help='Commit the database after adding each evidence batch (per all profiles)')
+	
+	def cmd_prepare_one(args):
+		db = Database(args.dbfile, autosave=False)
+		print(args.evidence)
+		print(args.profile)
+		case = run.Case()
+		for ev in args.evidence:
+			for prof in args.profile:
+				case\
+					.set_evidence(os.path.abspath(ev))\
+					.set_profile(os.path.abspath(prof))\
+					.set_contributors(args.contributors)\
+					.set_quantity(args.quantity)\
+					.set_deducible(args.deducible)\
+					.set_theta(args.theta)\
+					.set_labkitid(args.labkitid)
+				db.add_case(case)
+		db.save()
+		print('Done.')
+	
+	parser_prepare_one = subparsers.add_parser('prepare_one')
+	parser_prepare_one.set_defaults(func=cmd_prepare_one)
+	parser_prepare_one.add_argument('--evidence', '-e', required=True, nargs='+', help='Load this evidence file')
+	parser_prepare_one.add_argument('--profile', '-p', required=True, nargs='+', help='Load this profile file')
+	parser_prepare_one.add_argument('--contributors', '-C', required=True, help='Number of contributors')
+	parser_prepare_one.add_argument('--quantity', '-Q', required=True, help='Quantity in pg of the sample')
+	parser_prepare_one.add_argument('--deducible', '-D', action='store_true', help='Is contributor number deducible?')
+	parser_prepare_one.add_argument('--theta', '-T', default=0.03, help='Theta correction')
+	parser_prepare_one.add_argument('--labkitid', default=None, help='Lab Kit used')
 	
 	def cmd_prepare_related(args):
 		db = Database(args.dbfile, autosave=False)
@@ -274,10 +318,10 @@ if __name__ == '__main__':
 	parser_prepare_related = subparsers.add_parser('prepare_related')
 	parser_prepare_related.set_defaults(func=cmd_prepare_related)
 	parser_prepare_related.add_argument('-B', '--case-base', required=True, help='Load profiles under this directory')
-	parser_prepare_related.add_argument('-e', '--evidence-name', default='evidence.csv', help='Load evidence under this directory')
-	parser_prepare_related.add_argument('--comparison-re', default='\\d+.csv', help='Loaded evidence must match this glob pattern')
+	parser_prepare_related.add_argument('-e', '--evidence-name', default='evidence.tsv', help='Load evidence under this directory')
+	parser_prepare_related.add_argument('--comparison-re', default='contributor_\\d+.tsv', help='Loaded evidence must match this glob pattern')
 	parser_prepare_related.add_argument('-P', '--parameters', required=True, help='Mapping file for evidence filenames to parameters (must have Evidence,Contributors,Deducible,Quantity, optionally Theta,LabKitId)')
-	parser_prepare_related.add_argument('--default-theta', type=float, default=0.01, help='Default theta where not specified in parameters')
+	parser_prepare_related.add_argument('--default-theta', type=float, default=0.03, help='Default theta where not specified in parameters')
 	parser_prepare_related.add_argument('--default-labkitid', help='Default labkitid where not specified in parameters')
 	
 	def cmd_status(args):
@@ -287,10 +331,22 @@ if __name__ == '__main__':
 		finished = db.finished_cases()
 		total = db.total_cases()
 		
+		if total == 0:
+			print(f'Database is empty!')
+			return
+		
 		print(f'Progressing/Finished/Total {progressing}/{finished}/{total} ({100*finished/total:.2f}%)')
 		
 	parser_status = subparsers.add_parser('status')
 	parser_status.set_defaults(func=cmd_status)
+	
+	def cmd_list(args):
+		db = Database(args.dbfile, autosave=False)
+		for case in db.iter_cases():
+			print(case)
+			
+	parser_list = subparsers.add_parser('list')
+	parser_list.set_defaults(func=cmd_list)
 	
 	def cmd_clean(args):
 		db = Database(args.dbfile, autosave=True)
@@ -298,6 +354,19 @@ if __name__ == '__main__':
 		
 	parser_clean = subparsers.add_parser('clean')
 	parser_clean.set_defaults(func=cmd_clean)
+	
+	def cmd_reset(args):
+		if not args.force_reset:
+			print('THIS WILL DELETE YOUR DATA!')
+			print('If you really meant to run this operation, pass --force-reset.')
+			return
+			
+		db = Database(args.dbfile, autosave=True)
+		print('Reset', db.reset(), 'rows')
+		
+	parser_reset = subparsers.add_parser('reset')
+	parser_reset.set_defaults(func=cmd_reset)
+	parser_reset.add_argument('--force-reset', action='store_true', help=argparse.SUPPRESS)
 	
 	def cmd_run(args):
 		db = Database(args.dbfile, autosave=False)
@@ -421,11 +490,65 @@ if __name__ == '__main__':
 	parser_export.set_defaults(func=cmd_export)
 	parser_export.add_argument('exportfile', help='Database file to create for export')
 	
+	def cmd_extract(args):
+		db = Database(args.dbfile, autosave=False)
+		
+		fo = sys.stdout
+		if args.output:
+			fo = open(args.output, 'w')
+			
+		def case_nr(case, data):
+			return os.path.basename(os.path.dirname(case.evidence))
+			
+		def contrib_nr(case, data):
+			return os.path.splitext(os.path.basename(case.profile))[0] #.rpartition('_')[2]
+			
+		if args.case_nr:
+			case_nr = eval('lambda case, data: ' + args.case_nr)
+		if args.contrib_nr:
+			contrib_nr = eval('lambda case, data: ' + args.contrib_nr)
+			
+		wr = None
+		skip = args.skip
+		if skip is None:
+			skip = ()
+			
+		for case, odata in db.iter_results():
+			if wr is None:
+				keys = list(odata.keys())
+				for sk in skip:
+					try:
+						keys.remove(sk)
+					except ValueError:
+						pass
+				cols = ['Case', 'Contributor'] + keys
+				wr = csv.DictWriter(fo, cols)
+				wr.writeheader()
+				
+			row = odata.copy()
+			for sk in skip:
+				try:
+					del row[sk]
+				except KeyError:
+					pass
+			row['Case'] = case_nr(case, odata)
+			row['Contributor'] = contrib_nr(case, odata)
+			wr.writerow(row)
+			
+		print('Done.', file=sys.stderr)
+		
+	parser_extract = subparsers.add_parser('extract')
+	parser_extract.set_defaults(func=cmd_extract)
+	parser_extract.add_argument('--output', '-o', help='Output file to write (default stdout)')
+	parser_extract.add_argument('--skip', '-s', action='append', help='Skip this column (can be specified multiple times)')
+	parser_extract.add_argument('--case-nr', help='Python expression, with case and data in scope, to extract the case number. See source :)')
+	parser_extract.add_argument('--contrib-nr', help='Python expression, with case and data in scope, to extract the contributor. See source :)')
+	
 	gintf = parser_run.add_argument_group('Interface', 'Settings for the driver interface')
 	gintf.add_argument('-O', '--output-path', required=True, help='Path where FST is compiled to output data files (usually under repo root\\FST.Web\\Admin\\Upload). REQUIRED if you want this to output data.')
 	gintf.add_argument('--no-unlink', action='store_true', help='Don\'t remove output directories after they\'re scanned for output (only with -O)')
 	gintf.add_argument('-H', '--base-uri', default='http://localhost:2926', help='Base URI where the running FST instance is serving')
-	gintf.add_argument('--load-tmout', type=int, default=15, help='Page load timeout for selenium driver (seconds)')
+	gintf.add_argument('--load-tmout', type=int, default=45, help='Page load timeout for selenium driver (seconds)')
 	gintf.add_argument('--implicit-wait', type=int, help='Set implicit wait for this number of seconds to serialize loading')
 	gintf.add_argument('--window-width', type=int, default=1024, help='Selenium browser window width (pixels)')
 	gintf.add_argument('--window-height', type=int, default=768, help='Selenium browser window height (pixels)')
